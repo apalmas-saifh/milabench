@@ -223,6 +223,19 @@ grpo-vllm-gpus:
   enabled: true
   weight: 0.0
 
+# grpo-large (multi-node training of large Qwen checkpoints on AceReason-Math)
+grpo-large-72b:
+  enabled: true
+  weight: 1.0
+
+grpo-large-122b:
+  enabled: false
+  weight: 1.0
+
+grpo-large-397b:
+  enabled: false
+  weight: 1.0
+
 # vjepa
 vjepa-single:
   enabled: true

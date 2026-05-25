@@ -1,0 +1,39 @@
+
+_grpo_large:
+  inherits: _defaults
+  definition: .
+  install_variant: unpinned
+  install_group: torch
+  use_deepspeed: true
+  tags:
+    - rl
+    - grpo
+    - llm
+    - vllm
+  plan:
+    method: njobs
+    n: 1
+
+  argv:
+    --output_dir: "{milabench_extra}/output"
+    --model_name_or_path: "Qwen/Qwen2.5-1.5B"
+    --dataset_name: "nvidia/AceReason-Math"
+    --dataset_train_split: "train"
+    --per_device_train_batch_size: 1
+    --gradient_accumulation_steps: 4
+    --num_generations: 4
+    --max_completion_length: 1024
+    --max_steps: 5
+    --logging_strategy: "no"
+    --log_level: "critical"
+    --bf16: true
+    --gradient_checkpointing: true
+    --use_vllm: true
+    --vllm_mode: "colocate"
+    --vllm_gpu_memory_utilization: 0.3
+    --vllm_max_model_length: 2048
+
+
+grpo-large-dev:
+  inherits: _grpo_large
+  num_machines: 1
