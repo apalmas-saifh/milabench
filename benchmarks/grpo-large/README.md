@@ -3,38 +3,57 @@
 
 Multi-node GRPO benchmark for large Qwen checkpoints on
 `nvidia/AceReason-Math`. Trains the policy with TRL's `GRPOTrainer`,
-generates rollouts via co-located vLLM, and rewards correctness with a
-rule-based math verifier (`math_verify`) on the dataset's gold `answer`
-column. No separate reward model is loaded, so the per-GPU footprint is
-just the policy plus its Zero-3 shards.
+serves rollouts from **dedicated vLLM nodes** (not co-located), and
+rewards correctness with a rule-based math verifier (`math_verify`) on
+the dataset's gold `answer` column. No separate reward model is loaded.
 
-| Setting | Value |
-| --- | --- |
-| Trainer | `trl.GRPOTrainer` |
-| Reward | `math_verify`-based exact / equivalence check vs gold `answer` |
-| Dataset | `nvidia/AceReason-Math` (`train` split, columns `problem`→`prompt`, `answer`) |
-| Rollouts | co-located vLLM (`vllm_mode: colocate`) |
-| Sharding | DeepSpeed Zero-3 + CPU optimizer/parameter offload via Accelerate |
+## Architecture (disaggregated)
+
+```
+                       system.nodes
+   ┌─────────────────────────────────────────────────────────────┐
+   │                                                             │
+   │  vllm[0..M-1]                trainer[0..N-1]                │
+   │  ┌────────────┐              ┌────────────┐                 │
+   │  │ trl vllm-  │   /generate  │ accelerate │  DeepSpeed-     │
+   │  │ serve      │ ◀──────────  │ launch     │  Zero3 sharded  │
+   │  │ TP=8       │              │ main.py    │  across all     │
+   │  │ host the   │  weight push │            │  trainer GPUs   │
+   │  │ policy     │ ──────────▶  │            │                 │
+   │  └────────────┘              └────────────┘                 │
+   │                                                             │
+   └─────────────────────────────────────────────────────────────┘
+```
+
+The first `vllm_machines` entries of `system.nodes` are SSHed to run
+`trl vllm-serve` (TRL's `vllm serve` wrapper that adds the
+`update_named_param` endpoint GRPOTrainer needs). The remaining nodes
+SSH-launch `accelerate launch ... main.py --vllm_mode=server
+--vllm_server_host=<vllm-rank-0-ip> --vllm_server_port=8000`. TRL's
+`VLLMClient` polls `/health` until `vllm_server_timeout` elapses, so we
+don't need our own readiness wrapper.
 
 ## Variants
 
-| Bench | Model | `num_machines` (suggested) |
-| --- | --- | --- |
-| `grpo-large-72b`  | `Qwen/Qwen2.5-72B`         | 1 (8×80GB) |
-| `grpo-large-122b` | `Qwen/Qwen3.5-122B-A10B`   | 2          |
-| `grpo-large-397b` | `Qwen/Qwen3.5-397B-A17B`   | 8          |
+| Bench              | Model                      | Nodes (vLLM + trainer) | `num_generations` | `max_completion_length` |
+| ---                | ---                        | ---:                   | ---:              | ---:                    |
+| `grpo-large-72b`   | `Qwen/Qwen2.5-72B`         | 1 + 4 = **5**          | 2                 | 8192                    |
+| `grpo-large-122b`  | `Qwen/Qwen3.5-122B-A10B`   | 1 + 4 = **5**          | 4                 | 8192                    |
 
-The node counts are first-pass estimates assuming 80GB-class GPUs;
-override via `num_machines` in the YAML to match the actual cluster.
+## Memory budget (Qwen2.5-72B on 4×8 H100-80GB trainer + 1 vLLM node)
 
-## How multi-node is launched
+| Per-GPU on trainer side | GB |
+| --- | ---: |
+| Weights (144 GB / 32) | 4.5 |
+| Gradients | 4.5 |
+| AdamW state (864 GB / 32) | 27 |
+| **Static** | **36** |
+| Activations @ 8K, batch=1, num_gen=2, grad ckpt | ~25 |
+| **Peak per GPU** | **~61** |
 
-`benchfile.py` returns
-`AccelerateZero3AllNodes(PackCommand(...))`. Milabench's
-`AccelerateAllNodes` SSHes to each node in `system.nodes` and prepends
-`accelerate launch --num_machines/--machine_rank/--main_process_ip`. The
-`AccelerateZero3AllNodes` subclass appends Zero-3 + offload flags so the
-final command shards parameters across all visible GPUs.
+Comfortable fit, no offload needed. KL reference policy is disabled
+(`--beta 0`) — it would add another 4.5 GB/GPU and isn't needed for a
+throughput benchmark. Re-enable by setting `--beta 0.04` (default).
 
 ## Local dev
 
@@ -45,5 +64,8 @@ milabench prepare --config dev.yaml --base .
 milabench run     --config dev.yaml --base .
 ```
 
-`dev.yaml` uses `Qwen/Qwen2.5-1.5B` so the bench is iterable on a
-single-GPU box without burning a real allocation.
+`dev.yaml` uses `Qwen/Qwen2.5-1.5B` with 1 vLLM + 1 trainer (still
+exercises the disaggregated path end-to-end). You need a `system.yaml`
+with at least 2 nodes accessible via passwordless SSH; for single-host
+dev you can use loopback by listing the same host twice with different
+`name`s (but you'll need to pick different ports for vLLM).

@@ -14,6 +14,15 @@ _grpo_large:
     method: njobs
     n: 1
 
+  # Disaggregated: first `vllm_machines` nodes from `system.nodes` run
+  # `trl vllm-serve`; the rest run the Zero-3 trainer. For dev we want
+  # the smallest possible setup that still exercises the disaggregated
+  # path end-to-end: 1 vLLM node + 1 trainer node.
+  vllm_machines: 1
+  vllm_port: 8000
+  vllm_tensor_parallel_size: 2
+  vllm_server_timeout: 600
+
   argv:
     --output_dir: "{milabench_extra}/output"
     --model_name_or_path: "Qwen/Qwen2.5-1.5B"
@@ -21,19 +30,17 @@ _grpo_large:
     --dataset_train_split: "train"
     --per_device_train_batch_size: 1
     --gradient_accumulation_steps: 4
-    --num_generations: 4
+    --max_prompt_length: 512
     --max_completion_length: 1024
+    --num_generations: 2
     --max_steps: 5
+    --beta: 0
     --logging_strategy: "no"
     --log_level: "critical"
     --bf16: true
     --gradient_checkpointing: true
-    --use_vllm: true
-    --vllm_mode: "colocate"
-    --vllm_gpu_memory_utilization: 0.3
-    --vllm_max_model_length: 2048
 
 
 grpo-large-dev:
   inherits: _grpo_large
-  num_machines: 1
+  num_machines: 2

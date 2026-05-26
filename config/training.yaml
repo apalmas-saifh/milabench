@@ -959,28 +959,35 @@ _grpo_large:
   plan:
     method: njobs
     n: 1
+  # `num_machines` is the TOTAL nodes the bench claims from system.nodes;
+  # `vllm_machines` is how many of those are dedicated vLLM servers (the
+  # first slice). The remaining nodes run the Zero-3-sharded trainer and
+  # pull rollouts from the vLLM rank-0 server via TRL's `VLLMClient`.
+  vllm_machines: 1
+  vllm_port: 8000
+  vllm_tensor_parallel_size: 8
+  vllm_server_timeout: 1800
   argv:
     --output_dir: "{milabench_extra}/output"
     --dataset_name: "nvidia/AceReason-Math"
     --dataset_train_split: "train"
     --per_device_train_batch_size: 1
     --gradient_accumulation_steps: 8
-    --num_generations: 8
-    --max_completion_length: 2048
+    --max_prompt_length: 1024
+    --max_completion_length: 8192
+    --num_generations: 2
     --max_steps: 50
+    --beta: 0
     --logging_strategy: "no"
     --log_level: "critical"
     --dtype: bfloat16
     --bf16: true
     --gradient_checkpointing: true
-    --use_vllm: true
-    --vllm_mode: "colocate"
-    --vllm_gpu_memory_utilization: 0.4
-    --vllm_max_model_length: 4096
 
 grpo-large-72b:
   inherits: _grpo_large
-  num_machines: 1
+  num_machines: 5   # 1 vLLM + 4 trainer (32 H100-80GB total)
+  vllm_machines: 1
   argv:
     --model_name_or_path: "Qwen/Qwen2.5-72B"
   requires_capabilities:
@@ -988,17 +995,11 @@ grpo-large-72b:
 
 grpo-large-122b:
   inherits: _grpo_large
-  num_machines: 2
+  num_machines: 5   # 1 vLLM + 4 trainer; 122B-A10B has smaller hidden/layers
+  vllm_machines: 1
   argv:
     --model_name_or_path: "Qwen/Qwen3.5-122B-A10B"
-  requires_capabilities:
-    - "len(nodes) >= ${..num_machines}"
-
-grpo-large-397b:
-  inherits: _grpo_large
-  num_machines: 8
-  argv:
-    --model_name_or_path: "Qwen/Qwen3.5-397B-A17B"
+    --num_generations: 4
   requires_capabilities:
     - "len(nodes) >= ${..num_machines}"
 

@@ -1,41 +1,190 @@
 from milabench.pack import Package
 from milabench.commands import (
-    AccelerateAllNodes,
     AccelerateLaunchCommand,
     DockerRunCommand,
+    ForeachNode,
+    ListCommand,
     PackCommand,
+    SimpleCommand,
+    SSHCommand,
+    clone_with,
+    node_address,
 )
 from milabench.system import DockerConfig
+from milabench.utils import select_nodes
 
 
-# Milabench's `AccelerateLaunchCommand` hard-codes `--zero_stage=2` when the
-# bench sets `use_deepspeed: true`. For 72B+ Qwen MoE checkpoints we need
-# Zero-3 + CPU offload. We inject the extra accelerate flags after the
-# ones milabench emits so they win in argparse's "last value wins" rule.
-class AccelerateZero3AllNodes(AccelerateAllNodes):
-    def __init__(self, executor, *extra_argv, **kwargs) -> None:
-        super().__init__(executor, **kwargs)
-        self.extra_argv = extra_argv
+def _resolve_model_name(argv):
+    """Pull `--model_name_or_path <X>` (or `--model_name_or_path=<X>`) out of
+    the pack's already-resolved argv list."""
+    for i, tok in enumerate(argv):
+        s = str(tok)
+        if s == "--model_name_or_path" and i + 1 < len(argv):
+            return str(argv[i + 1])
+        if s.startswith("--model_name_or_path="):
+            return s.split("=", 1)[1]
+    raise RuntimeError(
+        "grpo-large: could not find --model_name_or_path in pack argv; "
+        "every grpo-large variant must set it in YAML."
+    )
 
-    def _wrap(self, executor, rank):
-        return AccelerateLaunchCommand(
-            executor, rank, *self.extra_argv, **self.options
+
+class GRPODisaggregatedNodes(ListCommand):
+    """Multi-node GRPO with vLLM rollouts on dedicated nodes.
+
+    Splits `system.nodes` into two groups:
+    - the first `vllm_machines` nodes each run `trl vllm-serve` hosting a
+      tensor-parallel copy of the policy for fast rollouts;
+    - the remaining nodes run `accelerate launch ... main.py` under
+      DeepSpeed Zero-3, sharing gradients/optimizer state across all
+      trainer GPUs and pulling completions from the vLLM servers via the
+      `vllm_mode=server` path that TRL's `VLLMClient` exposes.
+
+    The trainer's `--vllm_server_host` is injected at executor-build time
+    so the YAML doesn't need to know which IP rank-0-of-vLLM will land
+    on. `VLLMClient` polls `/health` until `--vllm_server_timeout` elapses,
+    so we don't need a separate readiness wait wrapper.
+    """
+
+    def __init__(
+        self,
+        executor,
+        *extra_accelerate_argv,
+        vllm_machines: int = 1,
+        vllm_port: int = 8000,
+        vllm_tensor_parallel_size: int = 8,
+        vllm_server_timeout: int = 1800,
+        **kwargs,
+    ) -> None:
+        super().__init__(None, **kwargs)
+        self.options.update(kwargs)
+        self.executor = executor
+        self.base_tags = self.executor.pack.config["tag"]
+        self.extra_accelerate_argv = extra_accelerate_argv
+        self.vllm_machines = vllm_machines
+        self.vllm_port = vllm_port
+        self.vllm_tensor_parallel_size = vllm_tensor_parallel_size
+        self.vllm_server_timeout = vllm_server_timeout
+
+    def _new_pack(
+        self,
+        role: str,
+        node,
+        num_machines,
+        has_logs: bool,
+        nodes_override=None,
+    ):
+        config = self.executor.pack.config
+        tags = [*self.base_tags, role, node["name"]]
+        if not has_logs:
+            tags.append("nolog")
+        overrides = {"tag": tags}
+        if num_machines is not None:
+            overrides["num_machines"] = num_machines
+        if nodes_override is not None:
+            # AccelerateLaunchCommand re-derives `--main_process_ip` and
+            # `--num_machines` from `system.nodes`. For the trainer pack
+            # we hide the vLLM-role nodes so it only sees the trainer
+            # slice.
+            overrides["system"] = {"nodes": nodes_override}
+        run = clone_with(config, overrides)
+        return self.executor.pack.copy(run)
+
+    def _maybe_docker(self, cmd, config):
+        docker = config["system"].get("docker")
+        if docker:
+            return DockerRunCommand(cmd, DockerConfig(**docker))
+        return cmd
+
+    def _vllm_executor(self, node, model, key, config):
+        pack = self._new_pack(
+            role="vllm", node=node, num_machines=None, has_logs=False
+        )
+        # trl-vllm-serve is the TRL-shipped CLI that wraps `vllm serve`
+        # with the extra `update_named_param` endpoint GRPOTrainer needs
+        # for weight broadcasts after each policy step.
+        cmd = SimpleCommand(
+            pack,
+            "trl", "vllm-serve",
+            "--model", model,
+            "--tensor_parallel_size", str(self.vllm_tensor_parallel_size),
+            "--host", "0.0.0.0",
+            "--port", str(self.vllm_port),
+        )
+        cmd = self._maybe_docker(cmd, config)
+        return SSHCommand(
+            host=node_address(node),
+            user=node["user"],
+            key=key,
+            port=node.get("sshport", 22),
+            executor=cmd,
         )
 
-    def single_node(self):
-        ngpu = len(self.executor.pack.config.get("devices", []))
-        if ngpu > 1:
-            return self._wrap(self.executor, 0)
-        return self.executor
-
-    def make_new_node_executor(self, rank, node, base):
-        config = base.pack.config
-        pack = self.make_new_node_pack(rank, node, base)
-        executor = base.copy(pack)
-        return DockerRunCommand(
-            self._wrap(executor, rank),
-            DockerConfig(**config["system"].get("docker", {})),
+    def _trainer_executor(
+        self, rank, node, trainer_nodes, vllm_host, key, config
+    ):
+        num_trainer = len(trainer_nodes)
+        pack = self._new_pack(
+            role="trainer",
+            node=node,
+            num_machines=num_trainer,
+            has_logs=(rank == 0),
+            nodes_override=trainer_nodes,
         )
+        # Reuse the pack's resolved argv (template variables already
+        # substituted) and append runtime-only flags pointing at the
+        # vLLM rank-0 server.
+        base_argv = list(self.executor.pack.argv)
+        extra_argv = [
+            "--use_vllm=True",
+            "--vllm_mode=server",
+            f"--vllm_server_host={vllm_host}",
+            f"--vllm_server_port={self.vllm_port}",
+            f"--vllm_server_timeout={self.vllm_server_timeout}",
+        ]
+        pack_cmd = PackCommand(pack, *base_argv, *extra_argv, lazy=True)
+        acc_cmd = AccelerateLaunchCommand(
+            pack_cmd, rank, *self.extra_accelerate_argv
+        )
+        acc_cmd = self._maybe_docker(acc_cmd, config)
+        return SSHCommand(
+            host=node_address(node),
+            user=node["user"],
+            key=key,
+            port=node.get("sshport", 22),
+            executor=acc_cmd,
+            setsid=(rank == 0),
+        )
+
+    @property
+    def executors(self):
+        config = self.executor.pack.config
+        max_num = config.get("num_machines", 1)
+        nodes = select_nodes(config["system"]["nodes"], max_num)
+        key = config["system"].get("sshkey")
+
+        if len(nodes) < self.vllm_machines + 1:
+            raise RuntimeError(
+                f"grpo-large disaggregated mode needs at least "
+                f"vllm_machines+1 nodes; got {len(nodes)} with "
+                f"vllm_machines={self.vllm_machines}."
+            )
+
+        vllm_nodes = nodes[: self.vllm_machines]
+        trainer_nodes = nodes[self.vllm_machines :]
+        vllm_host = node_address(vllm_nodes[0])
+        model = _resolve_model_name(list(self.executor.pack.argv))
+
+        cmds = []
+        for vn in vllm_nodes:
+            cmds.append(self._vllm_executor(vn, model, key, config))
+        for r, tn in enumerate(trainer_nodes):
+            cmds.append(
+                self._trainer_executor(
+                    r, tn, trainer_nodes, vllm_host, key, config
+                )
+            )
+        return cmds
 
 
 class GrpoLarge(Package):
@@ -54,12 +203,22 @@ class GrpoLarge(Package):
 
     def build_run_plan(self):
         plan = PackCommand(self, *self.argv, lazy=True)
-        return AccelerateZero3AllNodes(
+        # `--zero_stage=3 --zero3_init_flag=true` overrides milabench's
+        # hard-coded `--zero_stage=2` (use_deepspeed=true triggers that)
+        # by virtue of argparse's "last value wins". No CPU/NVMe offload
+        # is configured — the trainer side must fit purely in GPU VRAM.
+        vllm_machines = self.config.get("vllm_machines", 1)
+        vllm_port = self.config.get("vllm_port", 8000)
+        vllm_tp = self.config.get("vllm_tensor_parallel_size", 8)
+        vllm_timeout = self.config.get("vllm_server_timeout", 1800)
+        return GRPODisaggregatedNodes(
             plan,
             "--zero_stage=3",
-            "--offload_optimizer_device=cpu",
-            "--offload_param_device=cpu",
             "--zero3_init_flag=true",
+            vllm_machines=vllm_machines,
+            vllm_port=vllm_port,
+            vllm_tensor_parallel_size=vllm_tp,
+            vllm_server_timeout=vllm_timeout,
         ).use_stdout()
 
 
