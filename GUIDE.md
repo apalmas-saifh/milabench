@@ -47,6 +47,17 @@ source ~/.bashrc
 export MILABENCH_HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
+> **⚠️ `~/.bashrc` exports do NOT reach the remote trainer/vLLM ranks.**
+> milabench runs every node command over a **non-interactive** `ssh host -- …`
+> shell, and the stock `~/.bashrc` bails out at the top on the
+> `case $- in *i*) ;; *) return;; esac` guard before any export runs. So the
+> vars above are inherited only by the **launch node** (your interactive
+> shell). Anything the *remote ranks* need at runtime — most importantly
+> `NCCL_SOCKET_IFNAME` — must be injected through milabench's own command
+> chain, i.e. `benchmarks/grpo-large/scripts/with_modules` (see Step 5 and
+> Troubleshooting). Don't try to fix NCCL by editing `~/.bashrc`; it silently
+> does nothing on the remote side.
+
 **Passwordless SSH between cluster nodes** must be working:
 
 ```bash
@@ -223,6 +234,21 @@ uv run milabench run \
   --run-name grpo-large-122b-$(date +%Y%m%d-%H%M%S)
 ```
 
+> **Fixes already baked into this repo (learned the hard way):**
+> 1. **NCCL interface** — `scripts/with_modules` exports
+>    `NCCL_SOCKET_IFNAME=bond0` so NCCL uses the routable `10.28.1.x` net
+>    instead of an unroutable IB-over-IP rail. Without it, trainers die
+>    ~1–4 min in with `No route to host`.
+> 2. **TRL arg** — `--max_prompt_length` was removed from
+>    `config/training.yaml`; TRL 1.5.1's `GRPOConfig` no longer accepts it.
+> 3. **DeepSpeed GAS** — a top-level `gradient_accumulation_steps: 8` was
+>    added so the accelerate/DeepSpeed-plugin value matches the `argv` one;
+>    otherwise HF aborts at `deepspeed_init` with a `ds=1 vs hf=8` mismatch.
+>
+> All three live in the shared `_grpo_large` config / wrapper, so the 122B
+> run inherits them too. See Troubleshooting if you hit any of these symptoms
+> on a different cluster or TRL pin.
+
 What happens under the hood (from `benchmarks/grpo-large/benchfile.py`):
 
 1. milabench SSHes to **node0** and starts `trl vllm-serve
@@ -263,9 +289,12 @@ uv run milabench report --runs $MILABENCH_BASE/runs/grpo-large-72b-20260525-1430
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | `VLLMClient` times out after 1800 s | vLLM server didn't bind, or NCCL port firewalled | Tail `runs/<name>/grpo-large-*.vllm.stdout`. Common: TP=8 needs all 8 GPUs visible on node0; check `CUDA_VISIBLE_DEVICES`. |
-| Hang at first `update_named_param` | NCCL can't reach the trainer↔vLLM peers | Set `NCCL_SOCKET_IFNAME=<your IB iface>` in `~/.bashrc`. Default `lo` will hang. |
-| `Address already in use` on port 8000 | Leftover `trl vllm-serve` from a previous failed run | milabench does **not** kill the vLLM server when trainers crash (it's a persistent server, so the orchestrator hangs waiting on it). Before retrying: `ssh <main/vLLM node> 'pkill -9 -f vllm-serve'`. Or set a random `_grpo_large.vllm_port` in `config/training.yaml`. |
-| `MissingCUDAException: CUDA_HOME does not exist` (DeepSpeed) | SSH runs a non-login shell that never sources the module system | Handled automatically: the benchfile wraps every remote command with `scripts/with_modules`, loading the modules in the bench's `modules:` config key (default `cuda13.0/toolkit/13.0.2 nccl2-cuda13.0-gcc/2.28.9`). Adjust that key for a different cluster. |
+| Trainers die ~1–4 min in with `socketPollConnect … No route to host` / `ncclRemoteError: remote process exited prematurely` | NCCL auto-selected an interface that isn't routable between nodes. On this cluster the IB-over-IP rails (`100.126.x.x` / `100.127.x.x`) are **not** IP-routable peer-to-peer, but NCCL picks one anyway. The routable net is `bond0` (`10.28.1.x`) — the same one SSH uses. | **Already handled:** `scripts/with_modules` now exports `NCCL_SOCKET_IFNAME=bond0` for every remote rank. If your cluster's routable iface differs, override it: `export NCCL_SOCKET_IFNAME=<iface>` before the run (the wrapper uses `${NCCL_SOCKET_IFNAME:-bond0}`), or edit the wrapper. **Do not** put it in `~/.bashrc` — non-interactive SSH ignores it (see Prerequisites). Verify routability with `ping <peer-bond0-ip>` vs `ping <peer-ib-ip>`. |
+| Hang at first `update_named_param` | NCCL can't reach the trainer↔vLLM peers | Same root cause / fix as the row above — pin `NCCL_SOCKET_IFNAME` to the routable iface (`bond0` here). |
+| All ranks die instantly with `ValueError: Some specified arguments are not used by the HfArgumentParser: ['--max_prompt_length', …]` | Config↔library version skew: the installed **TRL 1.5.1** removed `max_prompt_length` from `GRPOConfig` (only `max_completion_length` remains). The earlier `0.18.x` warning in the logs is about **vLLM**, not TRL — don't be misled. | Already fixed: `--max_prompt_length` was removed from the `_grpo_large` block in `config/training.yaml`. If you change the TRL pin, dry-parse the argv first: `python -c "from transformers import HfArgumentParser; from trl import GRPOConfig, ModelConfig; from trl.scripts.utils import ScriptArguments; print(HfArgumentParser((ScriptArguments,GRPOConfig,ModelConfig)).parse_known_args([...])[1])"` and drop whatever it reports as unrecognized. |
+| Crash at `trainer.train()` → `deepspeed_init` with `ValueError: … ds gradient_accumulation_steps=1 vs hf gradient_accumulation_steps=8` | milabench builds the `accelerate launch --gradient_accumulation_steps=N` flag (which configures the DeepSpeed plugin) from a **top-level** config key `gradient_accumulation_steps` (default **1**), *separately* from the `--gradient_accumulation_steps` under `argv:` (which sets HF `TrainingArguments`). If only the argv one is set, the two disagree and HF refuses to start. | Already fixed: a top-level `gradient_accumulation_steps: 8` was added to `_grpo_large` to match the argv value. **Keep the two in sync** — any change to the argv `--gradient_accumulation_steps` must be mirrored in the top-level key. |
+| `Address already in use` on port 8000, **or** `milabench run` hangs forever after the trainers have already crashed | milabench does **not** kill the persistent vLLM server when trainers crash, so the orchestrator blocks waiting on it. ⚠️ `pkill -f vllm-serve` is **not enough**: vLLM's `tensor_parallel_size=8` spawns 8 worker subprocesses that **rename themselves to `VLLM::Worker_TP0..7`**, so they don't match `vllm-serve` and survive — each still pinning ~76 GB on its GPU. | Full teardown on the vLLM node: kill the workers by PID from nvidia-smi, then the parent: `nvidia-smi --query-compute-apps=pid --format=csv,noheader \| xargs -r kill -9; pkill -9 -f 'trl.*vllm-serve'`. Also kill the orchestrator **by PID** (`pgrep -f 'milabench run'` then `kill -9 <pid>` — don't `pkill -f "milabench run"`, the pattern matches its own command line and kills the wrong shell). On the trainer nodes, sweep leftovers: `pkill -9 -f 'grpo-large/main.py'`. Confirm GPUs are back to ~0 MiB before relaunching. |
+| `MissingCUDAException: CUDA_HOME does not exist` (DeepSpeed) | SSH runs a non-login shell that never sources the module system | Handled automatically: the benchfile wraps every remote command with `scripts/with_modules`, loading the modules in the bench's `modules:` config key (default `cuda13.0/toolkit/13.0.2 nccl2-cuda13.0-gcc/2.28.9`). The same wrapper is also the place that exports `NCCL_SOCKET_IFNAME` to the remote ranks (see the NCCL row below). Adjust both for a different cluster. |
 | `trl: command not found` on the vLLM node | venv not activated in the SSH shell | Handled automatically: the vLLM command runs through `with_modules … -- activator <venv> <cache> trl …`. If you customize the benchfile, keep the `activator` in the chain. |
 | `main.py: error: argument --bf16: expected one argument` | milabench renders YAML `true` as a **bare flag**, but this parser requires a value for `--bf16` | Quote the value in `config/training.yaml`: `--bf16: "True"` (renders as `--bf16 True`). `--gradient_checkpointing: true` is fine bare — its parser entry accepts no-arg. |
 | OOM on trainer GPU after a few steps | Activation memory under-budgeted | Drop `--max_completion_length` to 4096 or `--num_generations` to 1 in the YAML; re-run. |

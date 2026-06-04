@@ -38,4 +38,14 @@ if [ "${#mods[@]}" -gt 0 ]; then
     module load "${mods[@]}"
 fi
 
+# NCCL inter-node socket interface. milabench's non-interactive SSH shell never
+# sources ~/.bashrc (it `return`s early on the non-interactive guard), so any
+# NCCL_SOCKET_IFNAME exported there never reaches the remote ranks. Without it
+# NCCL auto-selects an interface and on this cluster picks an InfiniBand-over-IP
+# rail (100.126.x.x) that is NOT routable between nodes, so process-group init
+# dies with "socketPollConnect ... No route to host". bond0 (10.28.1.x) is the
+# routable Ethernet that SSH itself uses. Override by exporting the var before
+# the run if your cluster differs.
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-bond0}"
+
 exec "$@"

@@ -967,13 +967,23 @@ _grpo_large:
   vllm_port: 8000
   vllm_tensor_parallel_size: 8
   vllm_server_timeout: 1800
+  # Top-level (NOT under argv): milabench reads this to build the
+  # `accelerate launch --gradient_accumulation_steps=N` flag, which configures
+  # the DeepSpeed plugin. It MUST equal the `--gradient_accumulation_steps`
+  # under argv (which sets HF TrainingArguments); otherwise HF aborts with
+  # "ds gradient_accumulation_steps=1 vs hf gradient_accumulation_steps=8".
+  # Defaults to 1 when unset. Keep these two in sync.
+  gradient_accumulation_steps: 8
   argv:
     --output_dir: "{milabench_extra}/output"
     --dataset_name: "nvidia/AceReason-Math"
     --dataset_train_split: "train"
     --per_device_train_batch_size: 1
     --gradient_accumulation_steps: 8
-    --max_prompt_length: 1024
+    # `--max_prompt_length` was removed: TRL 1.5.1's GRPOConfig dropped that
+    # field (only `--max_completion_length` remains), so passing it makes
+    # HfArgumentParser abort with "arguments are not used". Re-add only if you
+    # pin a TRL version that restores it.
     --max_completion_length: 8192
     --num_generations: 2
     --max_steps: 50
