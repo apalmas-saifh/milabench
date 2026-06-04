@@ -229,7 +229,7 @@ grpo-large-72b:
   weight: 1.0
 
 grpo-large-122b:
-  enabled: false
+  enabled: true
   weight: 1.0
 
 # vjepa

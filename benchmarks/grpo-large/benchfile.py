@@ -1,11 +1,13 @@
+from copy import deepcopy
+
 from milabench.pack import Package
 from milabench.commands import (
     AccelerateLaunchCommand,
+    CmdCommand,
     DockerRunCommand,
     ForeachNode,
     ListCommand,
     PackCommand,
-    SimpleCommand,
     SSHCommand,
     clone_with,
     node_address,
@@ -65,6 +67,28 @@ class GRPODisaggregatedNodes(ListCommand):
         self.vllm_port = vllm_port
         self.vllm_tensor_parallel_size = vllm_tensor_parallel_size
         self.vllm_server_timeout = vllm_server_timeout
+        # Run options (e.g. use_stdout) set via set_run_options()/use_stdout()
+        # before `executors` is evaluated. We can't forward them to the leaf
+        # commands at call time because those are built lazily/fresh inside the
+        # `executors` property, so stash them and apply during the build.
+        self._run_options = {}
+
+    def set_run_options(self, **kwargs):
+        # ListCommand.set_run_options iterates self._executors, but this class
+        # builds its executors lazily in the `executors` property (self._executors
+        # is the placeholder (None,) from super().__init__). Stash instead and
+        # apply to each leaf command we build.
+        self._run_options.update(kwargs)
+        return self
+
+    def copy(self, pack):
+        # ListCommand.copy iterates self._executors (the (None,) placeholder
+        # from super().__init__), which would crash on None._set_pack. Like
+        # ForeachNode, retarget the template `self.executor` instead; the
+        # `executors` property rebuilds the per-node commands from it.
+        copy = deepcopy(self)
+        copy.executor._set_pack(pack)
+        return copy
 
     def _new_pack(
         self,
@@ -103,7 +127,13 @@ class GRPODisaggregatedNodes(ListCommand):
         # trl-vllm-serve is the TRL-shipped CLI that wraps `vllm serve`
         # with the extra `update_named_param` endpoint GRPOTrainer needs
         # for weight broadcasts after each policy step.
-        cmd = SimpleCommand(
+        #
+        # Use CmdCommand (not SimpleCommand): SimpleCommand prepends the
+        # pack's full training argv (--output_dir, --dataset_name, ...) to
+        # the command, which would be passed to `trl vllm-serve` and, worse,
+        # leak in front of the remote command in the SSH argv. CmdCommand
+        # runs exactly the tokens we give it.
+        cmd = CmdCommand(
             pack,
             "trl", "vllm-serve",
             "--model", model,
@@ -111,6 +141,7 @@ class GRPODisaggregatedNodes(ListCommand):
             "--host", "0.0.0.0",
             "--port", str(self.vllm_port),
         )
+        cmd.set_run_options(**self._run_options)
         cmd = self._maybe_docker(cmd, config)
         return SSHCommand(
             host=node_address(node),
@@ -143,6 +174,10 @@ class GRPODisaggregatedNodes(ListCommand):
             f"--vllm_server_timeout={self.vllm_server_timeout}",
         ]
         pack_cmd = PackCommand(pack, *base_argv, *extra_argv, lazy=True)
+        # Forward run options (use_stdout) to the leaf pack so trainer rank-0's
+        # metrics are scraped from stdout. They bubble up through the command
+        # chain's `options` property to execute().
+        pack_cmd.set_run_options(**self._run_options)
         acc_cmd = AccelerateLaunchCommand(
             pack_cmd, rank, *self.extra_accelerate_argv
         )
