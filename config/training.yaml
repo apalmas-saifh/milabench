@@ -981,7 +981,12 @@ _grpo_large:
     --logging_strategy: "no"
     --log_level: "critical"
     --dtype: bfloat16
-    --bf16: true
+    # Must be an explicit value, not YAML `true`: milabench renders boolean
+    # `true` as a bare flag (`--bf16`), but this parser defines `--bf16` as
+    # requiring an argument (`[--bf16 BF16]`), so a bare flag errors with
+    # "expected one argument". `--gradient_checkpointing` accepts a bare flag
+    # (`[--gradient_checkpointing [GRADIENT_CHECKPOINTING]]`) so it can stay.
+    --bf16: "True"
     --gradient_checkpointing: true
 
 grpo-large-72b:

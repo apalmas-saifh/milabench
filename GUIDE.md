@@ -16,7 +16,7 @@ Each bench needs **5 nodes** of 8×H100-80GB: 1 vLLM server + 4 trainers.
 | `milabench pin`     | Login node OK (you've already done this)                                  | Pure pip resolver; no GPU.                                                                       |
 | `milabench install` | **Compute node** (1 GPU enough)                                           | `vllm` / `deepspeed` / `torch` wheels probe `nvcc` / `nvidia-smi`. Login node will OOM the resolver and may kill long pip builds. |
 | `milabench prepare` | **Compute node** (1 GPU) **or** a network/data-staging node              | Downloads 145–244 GB from HuggingFace. Don't blow up login-node disk quotas.                     |
-| `milabench run`     | **Multi-node Slurm allocation**, command launched from the rank-0 trainer | The bench SSHs from there to every other node listed in `system.yaml`.                           |
+| `milabench run`     | **Multi-node Slurm allocation**, command launched from the `main` node (= the vLLM server) | milabench asserts the run is launched from the `main` node, then SSHs from there to every node listed in `system.yaml`. |
 
 `install` + `prepare` can share a single 1-GPU `salloc`. `run` needs
 the full 5-node allocation.
@@ -152,12 +152,12 @@ system:
   nodes:
 EOF
 
-# First node = vLLM server (rank 0 of the vLLM slice).
-# Remaining 4 nodes = trainers (rank 0 of trainers is the orchestrator).
+# First node = main = vLLM server = the node you launch milabench from.
+# Remaining 4 nodes = trainers.
 i=0
 for host in $(scontrol show hostnames $SLURM_JOB_NODELIST); do
   ip=$(getent hosts "$host" | awk '{ print $1 }')
-  main=$([ $i -eq 1 ] && echo "true" || echo "false")   # trainer rank-0 is main
+  main=$([ $i -eq 0 ] && echo "true" || echo "false")   # first node = main = vLLM
   cat >> runs/system.yaml <<EOF
     - name: node$i
       hostname: $host
@@ -171,27 +171,39 @@ done
 cat runs/system.yaml
 ```
 
-The first node in the list becomes the vLLM server (`benchfile.py`
-slices `vllm_nodes = nodes[:vllm_machines]`). The trainer's rank-0 is
-the **second** node — and that's the one that must be marked
-`main: true`, because milabench launches the orchestration command from
-the `main` node.
+**Why the first node is marked `main`.** Three milabench rules chain
+together and force a single topology:
 
-> **Important:** SSH from your current shell to the `main` node and run
-> the rest of the commands there. milabench's `ForeachNode` SSHes from
-> wherever you launch it to each entry in `system.nodes`; if you start
-> from a node not in the list, you'll add an extra hop and some
-> port-forwarding pain. Easiest:
+1. `milabench run` asserts you launch it **from the `main` node**
+   (`milabench/multi.py`: `assert is_main_local(...)`, "Running
+   benchmarks only works on the main node"). `self`/`main` is matched by
+   the launching machine's own IP.
+2. `select_nodes` always moves the `main` node to **index 0** of the
+   node list ("main node is always first").
+3. `benchfile.py` slices the vLLM server off the front:
+   `vllm_nodes = nodes[:vllm_machines]` (index 0).
+
+⇒ **launch node = `main` node = vLLM server** — they are necessarily the
+same machine. The remaining four are trainers; trainer rank-0 is the
+first non-`main` node and becomes the accelerate rendezvous
+(`--main_process_ip`). There is no valid setup where you launch from a
+trainer and vLLM lives elsewhere. (The milabench orchestrator is a
+lightweight coordinator that uses no GPUs, so it co-exists fine with the
+vLLM server's 8-GPU `tensor_parallel_size=8` on that node.)
+
+> **Important:** SSH from your current shell to the `main` (first) node
+> and run the rest of the commands there. If you launch from a node not
+> in `system.nodes`, the `is_main_local` assertion fails. Easiest:
 >
 > ```bash
-> ssh $(scontrol show hostnames $SLURM_JOB_NODELIST | sed -n '2p')
+> ssh $(scontrol show hostnames $SLURM_JOB_NODELIST | sed -n '1p')
 > ```
 
 ---
 
 ## Step 5 — Run
 
-On the main (trainer rank-0) node:
+On the `main` node (the first node = the vLLM server, which you SSH'd into at the end of step 4):
 
 ```bash
 module load cuda13.0/toolkit/13.0.2 nccl2-cuda13.0-gcc/2.28.9
@@ -252,9 +264,13 @@ uv run milabench report --runs $MILABENCH_BASE/runs/grpo-large-72b-20260525-1430
 | --- | --- | --- |
 | `VLLMClient` times out after 1800 s | vLLM server didn't bind, or NCCL port firewalled | Tail `runs/<name>/grpo-large-*.vllm.stdout`. Common: TP=8 needs all 8 GPUs visible on node0; check `CUDA_VISIBLE_DEVICES`. |
 | Hang at first `update_named_param` | NCCL can't reach the trainer↔vLLM peers | Set `NCCL_SOCKET_IFNAME=<your IB iface>` in `~/.bashrc`. Default `lo` will hang. |
-| `Address already in use` on port 8000 | Another user / leftover process on node0 | Edit `config/training.yaml`'s `_grpo_large.vllm_port` to a random port (e.g. `$RANDOM + 30000`). |
+| `Address already in use` on port 8000 | Leftover `trl vllm-serve` from a previous failed run | milabench does **not** kill the vLLM server when trainers crash (it's a persistent server, so the orchestrator hangs waiting on it). Before retrying: `ssh <main/vLLM node> 'pkill -9 -f vllm-serve'`. Or set a random `_grpo_large.vllm_port` in `config/training.yaml`. |
+| `MissingCUDAException: CUDA_HOME does not exist` (DeepSpeed) | SSH runs a non-login shell that never sources the module system | Handled automatically: the benchfile wraps every remote command with `scripts/with_modules`, loading the modules in the bench's `modules:` config key (default `cuda13.0/toolkit/13.0.2 nccl2-cuda13.0-gcc/2.28.9`). Adjust that key for a different cluster. |
+| `trl: command not found` on the vLLM node | venv not activated in the SSH shell | Handled automatically: the vLLM command runs through `with_modules … -- activator <venv> <cache> trl …`. If you customize the benchfile, keep the `activator` in the chain. |
+| `main.py: error: argument --bf16: expected one argument` | milabench renders YAML `true` as a **bare flag**, but this parser requires a value for `--bf16` | Quote the value in `config/training.yaml`: `--bf16: "True"` (renders as `--bf16 True`). `--gradient_checkpointing: true` is fine bare — its parser entry accepts no-arg. |
 | OOM on trainer GPU after a few steps | Activation memory under-budgeted | Drop `--max_completion_length` to 4096 or `--num_generations` to 1 in the YAML; re-run. |
-| `ssh: Permission denied (publickey)` | Cluster doesn't propagate keys to compute nodes | Verify `~/.ssh/authorized_keys` is on the shared FS and readable from compute. |
+| `ssh: Permission denied (publickey)` | Public key not in `~/.ssh/authorized_keys` (milabench SSHes to every node, including back to itself by IP) | `cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys`. With a shared-NFS `$HOME` this fixes all nodes at once. |
+| `AssertionError: Running benchmarks only works on the main node` | You launched `milabench run` from a node that isn't marked `main: true` | Launch from the `main` (first/vLLM) node — `ssh $(scontrol show hostnames $SLURM_JOB_NODELIST \| sed -n '1p')`. See step 4. |
 | Bench skipped with `requires_capabilities` failed | Fewer than 5 nodes in `system.yaml` | Check `scontrol show hostnames`; if Slurm gave you fewer than requested, your queue is constrained. |
 
 ---
@@ -270,7 +286,7 @@ uv run milabench install --select grpo-large-72b
 uv run milabench prepare --select grpo-large-72b
 uv run milabench prepare --select grpo-large-122b
 
-# Run (5-node salloc, from trainer rank-0 / main)
+# Run (5-node salloc, from the main node = first node = vLLM server)
 uv run milabench run --system runs/system.yaml --select grpo-large-72b
 uv run milabench run --system runs/system.yaml --select grpo-large-122b
 
@@ -318,7 +334,7 @@ mkdir -p runs
   i=0
   for host in $(scontrol show hostnames "$SLURM_JOB_NODELIST"); do
     ip=$(getent hosts "$host" | awk '{ print $1 }')
-    if [ "$i" -eq 1 ]; then main=true; else main=false; fi
+    if [ "$i" -eq 0 ]; then main=true; else main=false; fi   # first node = main = vLLM
     echo "    - name: node$i"
     echo "      hostname: $host"
     echo "      ip: $ip"
@@ -328,8 +344,8 @@ mkdir -p runs
   done
 } > "$SYSTEM_YAML"
 
-# --- Step 5 (inlined): run on the trainer rank-0 (= node1, main: true) -
-MAIN_HOST=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | sed -n '2p')
+# --- Step 5 (inlined): run on the main node (= node0, vLLM server) ----
+MAIN_HOST=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | sed -n '1p')
 RUN_NAME="grpo-large-$BENCH-$SLURM_JOB_ID"
 
 ssh -o StrictHostKeyChecking=no "$MAIN_HOST" bash -lc "'
@@ -351,6 +367,7 @@ sbatch run-grpo-large.sbatch 122b
 
 The script writes its own `system.yaml` under
 `$MILABENCH_BASE/runs/system-<jobid>.yaml` (so concurrent jobs don't
-clobber each other) and SSHes from the Slurm batch host onto the main
-trainer node before invoking `milabench run` — same topology as the
-interactive path.
+clobber each other) and SSHes from the Slurm batch host onto the `main`
+node (node0 = the vLLM server) before invoking `milabench run` — same
+topology as the interactive path, satisfying milabench's
+"run from the main node" assertion.
