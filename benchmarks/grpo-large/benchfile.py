@@ -1,3 +1,4 @@
+import os
 from copy import deepcopy
 
 from milabench.pack import Package
@@ -9,11 +10,27 @@ from milabench.commands import (
     ListCommand,
     PackCommand,
     SSHCommand,
+    WrapperCommand,
+    activator_script,
     clone_with,
     node_address,
 )
 from milabench.system import DockerConfig
 from milabench.utils import select_nodes
+
+# Default cluster modules to load on each remote node before running. milabench
+# SSHes in with a non-login shell that doesn't source the module system, so
+# without this DeepSpeed can't find CUDA_HOME. Override via the bench's
+# `modules:` config key.
+DEFAULT_NODE_MODULES = [
+    "cuda13.0/toolkit/13.0.2",
+    "nccl2-cuda13.0-gcc/2.28.9",
+]
+
+
+def _with_modules_script():
+    """Absolute path to the helper that loads modules then execs a command."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "with_modules")
 
 
 def _resolve_model_name(argv):
@@ -56,6 +73,7 @@ class GRPODisaggregatedNodes(ListCommand):
         vllm_port: int = 8000,
         vllm_tensor_parallel_size: int = 8,
         vllm_server_timeout: int = 1800,
+        modules=None,
         **kwargs,
     ) -> None:
         super().__init__(None, **kwargs)
@@ -67,6 +85,7 @@ class GRPODisaggregatedNodes(ListCommand):
         self.vllm_port = vllm_port
         self.vllm_tensor_parallel_size = vllm_tensor_parallel_size
         self.vllm_server_timeout = vllm_server_timeout
+        self.modules = list(modules) if modules else []
         # Run options (e.g. use_stdout) set via set_run_options()/use_stdout()
         # before `executors` is evaluated. We can't forward them to the leaf
         # commands at call time because those are built lazily/fresh inside the
@@ -120,6 +139,13 @@ class GRPODisaggregatedNodes(ListCommand):
             return DockerRunCommand(cmd, DockerConfig(**docker))
         return cmd
 
+    def _module_prefix(self):
+        # Tokens that load the cluster modules then exec the rest. Always
+        # emitted (even with no modules) so the command runs through the same
+        # `with_modules ... -- <cmd>` shape; the script is a no-op load when
+        # the module list is empty.
+        return [_with_modules_script(), *self.modules, "--"]
+
     def _vllm_executor(self, node, model, key, config):
         pack = self._new_pack(
             role="vllm", node=node, num_machines=None, has_logs=False
@@ -133,8 +159,14 @@ class GRPODisaggregatedNodes(ListCommand):
         # the command, which would be passed to `trl vllm-serve` and, worse,
         # leak in front of the remote command in the SSH argv. CmdCommand
         # runs exactly the tokens we give it.
+        #
+        # `with_modules ... -- activator <venv> <cache> trl vllm-serve ...`:
+        # load cluster modules (CUDA), then the activator activates the venv so
+        # `trl` is on PATH (the SSH shell has neither otherwise).
         cmd = CmdCommand(
             pack,
+            *self._module_prefix(),
+            activator_script(), str(pack.dirs.venv), str(pack.dirs.cache),
             "trl", "vllm-serve",
             "--model", model,
             "--tensor_parallel_size", str(self.vllm_tensor_parallel_size),
@@ -181,6 +213,11 @@ class GRPODisaggregatedNodes(ListCommand):
         acc_cmd = AccelerateLaunchCommand(
             pack_cmd, rank, *self.extra_accelerate_argv
         )
+        # Prepend module loading so DeepSpeed finds CUDA_HOME on the remote
+        # node. AccelerateLaunchCommand already emits the venv `activator`; the
+        # wrapper just loads modules first, i.e. the remote command becomes
+        # `with_modules ... -- activator <venv> <cache> accelerate launch ...`.
+        acc_cmd = WrapperCommand(acc_cmd, *self._module_prefix())
         acc_cmd = self._maybe_docker(acc_cmd, config)
         return SSHCommand(
             host=node_address(node),
@@ -246,6 +283,10 @@ class GrpoLarge(Package):
         vllm_port = self.config.get("vllm_port", 8000)
         vllm_tp = self.config.get("vllm_tensor_parallel_size", 8)
         vllm_timeout = self.config.get("vllm_server_timeout", 1800)
+        # Cluster modules to load on each remote node (CUDA toolkit, NCCL).
+        # milabench's SSH shell is non-login and doesn't source the module
+        # system, so DeepSpeed otherwise fails with MissingCUDAException.
+        modules = self.config.get("modules", DEFAULT_NODE_MODULES)
         return GRPODisaggregatedNodes(
             plan,
             "--zero_stage=3",
@@ -254,6 +295,7 @@ class GrpoLarge(Package):
             vllm_port=vllm_port,
             vllm_tensor_parallel_size=vllm_tp,
             vllm_server_timeout=vllm_timeout,
+            modules=modules,
         ).use_stdout()
 
 

@@ -1,0 +1,41 @@
+#!/bin/bash
+# Load environment modules on a remote node before running a command.
+#
+# milabench SSHes into each node with a *non-interactive, non-login* shell,
+# which does not source the cluster module system. As a result CUDA_HOME is
+# unset (DeepSpeed aborts with MissingCUDAException) and module-provided libs
+# (NCCL, cuda runtime) are not on the library path. This wrapper makes the
+# `module` function available, loads the requested modules, then execs the
+# real command.
+#
+# Usage:
+#   with_modules <module> [<module> ...] -- <command> [args ...]
+set -e
+
+# Make the `module` shell function available in this non-login shell.
+if [ -z "$(type -t module)" ]; then
+    for init in /etc/profile.d/modules.sh \
+                "${MODULESHOME}/init/bash" \
+                /cm/local/apps/environment-modules/current/init/bash; do
+        if [ -r "$init" ]; then
+            # shellcheck disable=SC1090
+            source "$init"
+            break
+        fi
+    done
+fi
+
+# Collect module names up to the `--` separator.
+mods=()
+while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+    mods+=("$1")
+    shift
+done
+[ "$1" = "--" ] && shift
+
+if [ "${#mods[@]}" -gt 0 ]; then
+    # module load chatter goes to stderr, keeping stdout clean for metrics.
+    module load "${mods[@]}"
+fi
+
+exec "$@"
