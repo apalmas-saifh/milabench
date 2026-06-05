@@ -48,4 +48,12 @@ fi
 # the run if your cluster differs.
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-bond0}"
 
+# CUDA caching-allocator policy. `expandable_segments:True` lets the allocator
+# grow/shrink segments instead of pre-committing fixed blocks, which cuts
+# fragmentation-driven OOMs on the trainer ranks (72B Zero-3 runs right up to
+# the 80 GB ceiling). Same rationale as NCCL above: it must be exported into
+# the remote rank's env here, because ~/.bashrc is skipped over non-interactive
+# SSH. Harmless for the vLLM rank too. Override by exporting it before the run.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 exec "$@"
