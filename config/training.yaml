@@ -946,7 +946,7 @@ _grpo_large:
   definition: ../benchmarks/grpo-large
   install_group: torch
   use_deepspeed: true
-  max_duration: 7200
+  max_duration: 14400   # 4h: the FSDP2+TP path needs a long (single-stream-ish) weight load before training
   voir:
     options:
       stop: 20
@@ -1001,8 +1001,19 @@ _grpo_large:
 
 grpo-large-72b:
   inherits: _grpo_large
-  num_machines: 5   # 1 vLLM + 4 trainer (32 H100-80GB total)
+  num_machines: 9   # 1 vLLM + 8 trainer (64 H100-80GB total)
   vllm_machines: 1
+  # Trainer uses FSDP2 + tensor parallelism instead of DeepSpeed Zero-3.
+  # Rationale: dense-72B + 8192-token completions OOMs under pure Zero-3 even
+  # at 64 GPUs, because the dominant per-GPU term (logits ~9216×152k vocab +
+  # activations) does NOT shard with data parallelism — adding nodes only
+  # shrinks the sharded static state, not this. TP splits the lm-head/logits
+  # and activations across the TP group, attacking the term at its source.
+  # `trainer_tp_size: 4` => 4-GPU TP groups (intra-node, over NVLink) and
+  # FSDP2 dp_shard across the remaining 16 ranks (4×16 = 64 = num_processes).
+  # Effective global batch = per_device(1) × grad_accum(8) × dp_shard(16) = 128.
+  use_deepspeed: false
+  trainer_tp_size: 4
   argv:
     --model_name_or_path: "Qwen/Qwen2.5-72B"
   requires_capabilities:

@@ -25,6 +25,7 @@ import accelerate
 from accelerate import PartialState
 from datasets import load_dataset
 from transformers import (
+    AutoModelForCausalLM,
     AutoTokenizer,
     HfArgumentParser,
 )
@@ -193,9 +194,38 @@ def main():
         train_dataset = train_dataset.select_columns(keep_cols)
         eval_dataset = eval_dataset.select_columns(keep_cols)
 
+    # --- Tensor parallelism: load the policy as DTensor so TP actually engages ---
+    # If we pass `model=<path string>` to the trainer, TRL loads it via
+    # `from_pretrained(device_map="auto")` -> plain tensors -> accelerate's
+    # `_prepare_tp` silently SKIPS TP ("parameters are not sharded by DTensor").
+    # To engage TP we must load here with `tp_plan="auto"` and the *tp* sub-mesh
+    # of accelerate's 2D (dp_shard x tp) device mesh; transformers' own TP init
+    # only builds a 1D (tp_size,) mesh, which can't compose with FSDP2's dp_shard.
+    # When TP is not configured (tp_size<=1, e.g. the DeepSpeed variant), we keep
+    # passing the path string and TRL loads as before.
+    model_for_trainer = model_args.model_name_or_path
+    _pc = getattr(training_args, "parallelism_config", None)
+    if _pc is None and os.environ.get("ACCELERATE_USE_PARALLELISM_CONFIG", "").lower() == "true":
+        from accelerate.parallelism_config import ParallelismConfig
+        _pc = ParallelismConfig()  # reads PARALLELISM_CONFIG_* from env
+    if _pc is not None and getattr(_pc, "tp_size", 1) and _pc.tp_size > 1:
+        PartialState()  # bring up the process group before building the device mesh
+        _tp_mesh = _pc.get_device_mesh("cuda")["tp"]
+        # `tp_plan` and `device_map` are mutually exclusive in from_pretrained.
+        _tp_kwargs = {k: v for k, v in model_kwargs.items() if k != "device_map"}
+        model_for_trainer = AutoModelForCausalLM.from_pretrained(
+            model_args.model_name_or_path,
+            tp_plan="auto",
+            device_mesh=_tp_mesh,
+            trust_remote_code=model_args.trust_remote_code,
+            **_tp_kwargs,
+        )
+        print(f"[grpo-large] Loaded policy with tensor parallelism (tp_size={_pc.tp_size}) "
+              f"as DTensor for TP", flush=True)
+
     trainer = GRPOTrainerInstrumented(
         args=training_args,
-        model=model_args.model_name_or_path,
+        model=model_for_trainer,
         reward_funcs=[math_verify_reward],
         processing_class=tokenizer,
         train_dataset=train_dataset,

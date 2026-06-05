@@ -48,6 +48,70 @@ def _resolve_model_name(argv):
     )
 
 
+class FSDP2TPAccelerateLaunchCommand(AccelerateLaunchCommand):
+    """`accelerate launch` for FSDP2 + tensor parallelism (replaces DeepSpeed).
+
+    milabench's stock AccelerateLaunchCommand only emits `--use_deepspeed`
+    (when `use_deepspeed: true`) or `--multi_gpu`. But accelerate refuses
+    `--multi_gpu` together with `--use_fsdp`
+    (`sum([multi_gpu, ..., use_fsdp]) > 1` raises), and `--use_parallelism_config`
+    *requires* `--use_fsdp --fsdp_version=2`. So for the 2D-parallel
+    (TP x FSDP2-shard) trainer we emit the flag set ourselves.
+
+    Topology: `tp_size` GPUs form a tensor-parallel group (kept intra-node so
+    the TP all-reduces ride NVLink); FSDP2 then shards parameters/grads/optimizer
+    across the remaining `num_processes // tp_size` ranks (the dp_shard mesh dim).
+    `tp_size * dp_shard == num_processes` is required by accelerate's device mesh.
+
+    Unlike the DeepSpeed path we deliberately omit `--gradient_accumulation_steps`
+    here: under FSDP the HF Trainer drives accumulation from its own
+    `TrainingArguments`, so passing it on the launcher too risks a double count.
+    """
+
+    def __init__(self, pack, rank, *accelerate_argv, tp_size=4, **kwargs):
+        super().__init__(pack, rank, *accelerate_argv, **kwargs)
+        self.tp_size = tp_size
+
+    def _argv(self, **_):
+        manager, nodes = self._get_main_and_workers()
+        num_machines = max(1, len(nodes) + 1)
+        ngpu = len(self.pack.config["devices"])
+        nproc = ngpu * num_machines
+        if nproc % self.tp_size != 0:
+            raise RuntimeError(
+                f"grpo-large FSDP2+TP: num_processes ({nproc}) must be divisible "
+                f"by tp_size ({self.tp_size})."
+            )
+        dp_shard = nproc // self.tp_size
+        return [
+            activator_script(), f"{self.pack.dirs.venv}", f"{self.pack.dirs.cache}",
+            "accelerate", "launch",
+            "--mixed_precision=bf16",
+            "--dynamo_backend=no",
+            f"--machine_rank={self.rank}",
+            f"--num_machines={num_machines}",
+            "--use_fsdp",
+            "--fsdp_version=2",
+            "--fsdp_auto_wrap_policy=TRANSFORMER_BASED_WRAP",
+            "--fsdp_transformer_layer_cls_to_wrap=Qwen2DecoderLayer",
+            "--fsdp_reshard_after_forward=true",
+            # NOTE: do NOT enable `--fsdp_cpu_ram_efficient_loading` here. It makes
+            # rank 0 load the full checkpoint as plain (non-DTensor) tensors and
+            # broadcast — which causes accelerate's `_prepare_tp` to SKIP tensor
+            # parallelism ("parameters are not sharded by DTensor"). TP is instead
+            # engaged at load time in main.py via `from_pretrained(tp_plan="auto",
+            # device_mesh=<tp submesh>)`, which also shards the read per TP rank.
+            "--use_parallelism_config",
+            f"--parallelism_config_tp_size={self.tp_size}",
+            f"--parallelism_config_dp_shard_size={dp_shard}",
+            "--num_cpu_threads_per_process=4",
+            f"--main_process_ip={manager['ip']}",
+            "--main_process_port=29400",
+            f"--num_processes={nproc}",
+            *self.accelerate_argv,
+        ]
+
+
 class GRPODisaggregatedNodes(ListCommand):
     """Multi-node GRPO with vLLM rollouts on dedicated nodes.
 
@@ -73,6 +137,7 @@ class GRPODisaggregatedNodes(ListCommand):
         vllm_port: int = 8000,
         vllm_tensor_parallel_size: int = 8,
         vllm_server_timeout: int = 1800,
+        trainer_tp_size: int = 0,
         modules=None,
         **kwargs,
     ) -> None:
@@ -85,6 +150,9 @@ class GRPODisaggregatedNodes(ListCommand):
         self.vllm_port = vllm_port
         self.vllm_tensor_parallel_size = vllm_tensor_parallel_size
         self.vllm_server_timeout = vllm_server_timeout
+        # >1 selects the FSDP2 + tensor-parallel trainer launch (replacing
+        # DeepSpeed); 0/1 keeps the DeepSpeed Zero-3 path.
+        self.trainer_tp_size = trainer_tp_size
         self.modules = list(modules) if modules else []
         # Run options (e.g. use_stdout) set via set_run_options()/use_stdout()
         # before `executors` is evaluated. We can't forward them to the leaf
@@ -210,9 +278,15 @@ class GRPODisaggregatedNodes(ListCommand):
         # metrics are scraped from stdout. They bubble up through the command
         # chain's `options` property to execute().
         pack_cmd.set_run_options(**self._run_options)
-        acc_cmd = AccelerateLaunchCommand(
-            pack_cmd, rank, *self.extra_accelerate_argv
-        )
+        if self.trainer_tp_size and self.trainer_tp_size > 1:
+            acc_cmd = FSDP2TPAccelerateLaunchCommand(
+                pack_cmd, rank, *self.extra_accelerate_argv,
+                tp_size=self.trainer_tp_size,
+            )
+        else:
+            acc_cmd = AccelerateLaunchCommand(
+                pack_cmd, rank, *self.extra_accelerate_argv
+            )
         # Prepend module loading so DeepSpeed finds CUDA_HOME on the remote
         # node. AccelerateLaunchCommand already emits the venv `activator`; the
         # wrapper just loads modules first, i.e. the remote command becomes
@@ -275,10 +349,6 @@ class GrpoLarge(Package):
 
     def build_run_plan(self):
         plan = PackCommand(self, *self.argv, lazy=True)
-        # `--zero_stage=3 --zero3_init_flag=true` overrides milabench's
-        # hard-coded `--zero_stage=2` (use_deepspeed=true triggers that)
-        # by virtue of argparse's "last value wins". No CPU/NVMe offload
-        # is configured — the trainer side must fit purely in GPU VRAM.
         vllm_machines = self.config.get("vllm_machines", 1)
         vllm_port = self.config.get("vllm_port", 8000)
         vllm_tp = self.config.get("vllm_tensor_parallel_size", 8)
@@ -287,14 +357,27 @@ class GrpoLarge(Package):
         # milabench's SSH shell is non-login and doesn't source the module
         # system, so DeepSpeed otherwise fails with MissingCUDAException.
         modules = self.config.get("modules", DEFAULT_NODE_MODULES)
+        # `trainer_tp_size > 1` switches the trainer to FSDP2 + tensor
+        # parallelism (the dense-72B + long-completion case OOMs under pure
+        # DeepSpeed Zero-3 because the per-GPU logits/activations don't shard
+        # with data parallelism — TP splits them). `0`/unset keeps DeepSpeed.
+        trainer_tp_size = self.config.get("trainer_tp_size", 0)
+        if trainer_tp_size and trainer_tp_size > 1:
+            # FSDP2 path: no DeepSpeed Zero args. FSDP2 full-shard ("reshard
+            # after forward") is the ZeRO-3 equivalent and is set on the launcher.
+            extra_accelerate_argv = []
+        else:
+            # DeepSpeed path: `--zero_stage=3 --zero3_init_flag=true` override
+            # milabench's hard-coded `--zero_stage=2` by argparse "last wins".
+            extra_accelerate_argv = ["--zero_stage=3", "--zero3_init_flag=true"]
         return GRPODisaggregatedNodes(
             plan,
-            "--zero_stage=3",
-            "--zero3_init_flag=true",
+            *extra_accelerate_argv,
             vllm_machines=vllm_machines,
             vllm_port=vllm_port,
             vllm_tensor_parallel_size=vllm_tp,
             vllm_server_timeout=vllm_timeout,
+            trainer_tp_size=trainer_tp_size,
             modules=modules,
         ).use_stdout()
 
